@@ -13,6 +13,7 @@ path = "src/gpui_wgpu.rs"
 doctest = false
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions"]
 default = []
 bench-support = ["gpui/bench-support", "dep:image"]
 font-kit = ["dep:font-kit"]

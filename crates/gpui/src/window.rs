@@ -2890,6 +2890,13 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// Returns the completed scene for assertions on primitive ordering and composition.
+    /// This observes the most recent draw without rasterizing or copying its resources.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_scene(&self) -> &Scene {
+        &self.rendered_frame.scene
+    }
+
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
@@ -5189,6 +5196,67 @@ impl Window {
         });
     }
 
+    /// Composite a prepared texture using this window's own device.
+    ///
+    /// Publish a texture and associated interaction overlays only after preparation
+    /// succeeds. Referenced texture contents must remain immutable until the scene
+    /// releases them. This method validates device ownership before scene insertion.
+    #[cfg(feature = "gpu-extensions")]
+    pub fn paint_gpu_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: Arc<dyn crate::GpuTexture>,
+        mut options: crate::GpuTextureOptions,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        let service = self.gpu_service()?;
+        anyhow::ensure!(
+            texture.service_id() == service.service_id() && texture.epoch() == service.epoch(),
+            "GPU texture is not owned by this window's current device"
+        );
+        anyhow::ensure!(
+            options.opacity.is_finite()
+                && (0.0..=1.0).contains(&options.opacity)
+                && options.transform.iter().all(|value| value.is_finite()),
+            "Invalid GPU texture compositing parameters"
+        );
+        options.opacity *= self.element_opacity();
+        let destination = self.snap_bounds(bounds);
+        options.transform[4] *= self.scale_factor();
+        options.transform[5] *= self.scale_factor();
+        let [a, b, c, d, tx, ty] = options.transform;
+        let width = destination.size.width.0;
+        let height = destination.size.height.0;
+        let corners = [(0.0, 0.0), (width, 0.0), (0.0, height), (width, height)];
+        let mut minimum = [f32::INFINITY; 2];
+        let mut maximum = [f32::NEG_INFINITY; 2];
+        for (x, y) in corners {
+            let transformed = [a * x + c * y + tx, b * x + d * y + ty];
+            for axis in 0..2 {
+                minimum[axis] = minimum[axis].min(transformed[axis]);
+                maximum[axis] = maximum[axis].max(transformed[axis]);
+            }
+        }
+        let bounds = Bounds::new(
+            destination.origin + point(ScaledPixels(minimum[0]), ScaledPixels(minimum[1])),
+            size(
+                ScaledPixels(maximum[0] - minimum[0]),
+                ScaledPixels(maximum[1] - minimum[1]),
+            ),
+        );
+        self.next_frame
+            .scene
+            .insert_primitive(crate::PaintGpuTexture {
+                order: 0,
+                bounds,
+                destination,
+                content_mask: self.snapped_content_mask(),
+                texture,
+                options,
+            });
+        Ok(())
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
@@ -6969,6 +7037,12 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Obtain the GPU device service that owns this window's renderer.
+    #[cfg(feature = "gpu-extensions")]
+    pub fn gpu_service(&self) -> Result<Arc<dyn crate::GpuService>> {
+        self.platform_window.gpu_service()
     }
 
     /// Perform titlebar double-click action.

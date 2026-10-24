@@ -16,6 +16,8 @@ use gpui::{
 pub(crate) struct DirectXAtlas(Mutex<AtlasState<DirectXAtlasTextures>>);
 
 struct DirectXAtlasTextures {
+    #[cfg(feature = "gpu-extensions")]
+    revision: u64,
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
@@ -35,12 +37,19 @@ struct DirectXAtlasTexture {
 impl DirectXAtlas {
     pub(crate) fn new(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Self {
         DirectXAtlas(Mutex::new(AtlasState::new(DirectXAtlasTextures {
+            #[cfg(feature = "gpu-extensions")]
+            revision: 0,
             device: device.clone(),
             device_context: device_context.clone(),
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
         })))
+    }
+
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) fn content_revision(&self) -> u64 {
+        self.0.lock().backend.revision
     }
 
     /// Returns the view backing `id`, or `None` once every tile in it has been
@@ -63,6 +72,10 @@ impl DirectXAtlas {
     ) {
         let mut lock = self.0.lock();
         lock.clear(|textures| {
+            #[cfg(feature = "gpu-extensions")]
+            {
+                textures.revision = textures.revision.wrapping_add(1);
+            }
             textures.device = device.clone();
             textures.device_context = device_context.clone();
             textures.monochrome_textures = AtlasTextureList::default();
@@ -102,6 +115,10 @@ impl AtlasBackend for DirectXAtlasTextures {
             .texture(tile.texture_id)
             .ok_or_else(|| anyhow::anyhow!("allocated tile refers to a missing texture"))?;
         texture.upload(&self.device_context, tile.bounds, bytes);
+        #[cfg(feature = "gpu-extensions")]
+        {
+            self.revision = self.revision.wrapping_add(1);
+        }
         Ok(tile)
     }
 
@@ -119,6 +136,10 @@ impl AtlasBackend for DirectXAtlasTextures {
         };
 
         if let Some(mut texture) = texture_slot.take() {
+            #[cfg(feature = "gpu-extensions")]
+            {
+                self.revision = self.revision.wrapping_add(1);
+            }
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {

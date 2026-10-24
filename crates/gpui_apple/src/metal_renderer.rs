@@ -821,6 +821,10 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                #[cfg(feature = "gpu-extensions")]
+                PrimitiveBatch::GpuTextures(_) => {
+                    anyhow::bail!("GPU texture extensions are not implemented by the Metal backend")
+                }
             }
         }
 

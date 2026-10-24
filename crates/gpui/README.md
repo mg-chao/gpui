@@ -85,6 +85,10 @@ Each of these registers has one or more corresponding contexts that can be acces
 
 ## Other Resources
 
+The optional `gpu-extensions` feature supports retained images rendered on GPUI's
+own device, with a Windows D3D11 implementation. See [GPU extensions](GPU_EXTENSIONS.md)
+for device ownership, scene publication, damage, and asynchronous readback contracts.
+
 In addition to the systems above, GPUI provides a range of smaller services that are useful for building complex applications:
 
 - Actions are user-defined structs that are used for converting keystrokes into logical operations in your UI. Use this for implementing keyboard shortcuts, such as cmd-q. See the `action` module for more information.

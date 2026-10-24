@@ -41,6 +41,8 @@ pub(crate) struct DirectXDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) gpu_service: std::sync::Arc<crate::gpu_extensions::DirectXGpuService>,
 }
 
 impl DirectXDevices {
@@ -63,7 +65,12 @@ impl DirectXDevices {
             _ => unreachable!(),
         }
 
+        #[cfg(feature = "gpu-extensions")]
+        let gpu_service =
+            crate::gpu_extensions::DirectXGpuService::new(device.clone(), device_context.clone());
         Ok(Self {
+            #[cfg(feature = "gpu-extensions")]
+            gpu_service,
             adapter,
             dxgi_factory,
             device,

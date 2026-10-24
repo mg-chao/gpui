@@ -68,6 +68,29 @@ mod shader_compilation {
                 &rust_binding_path,
             );
         }
+
+        #[cfg(feature = "gpu-extensions")]
+        {
+            let shader_path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("src/gpu_texture.hlsl");
+            println!("cargo:rerun-if-changed={}", shader_path.display());
+            for (entry, target, filename) in [
+                ("vertex_main", "vs_4_1", "gpu_texture_vs.cso"),
+                ("fragment_main", "ps_4_1", "gpu_texture_ps.cso"),
+            ] {
+                let output = Command::new(&fxc_path)
+                    .args(["/T", target, "/E", entry, "/O3", "/Ges", "/Fo"])
+                    .arg(Path::new(&out_dir).join(filename))
+                    .arg(&shader_path)
+                    .output()
+                    .expect("Failed to run fxc for GPU texture shader");
+                assert!(
+                    output.status.success(),
+                    "GPU texture shader compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 
     /// Locate `binary` in the newest installed Windows SDK.

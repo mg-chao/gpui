@@ -13,6 +13,7 @@ path = "src/gpui_platform.rs"
 doctest = false
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions", "gpui_windows/gpu-extensions", "gpui_macos/gpu-extensions", "gpui_ios/gpu-extensions", "gpui_linux/gpu-extensions", "gpui_web/gpu-extensions", "gpui_wgpu?/gpu-extensions"]
 default = ["multithreaded"]
 # Threads in the browser: needs a nightly toolchain and a cross-origin-isolated
 # page. Off, gpui_web builds on stable.

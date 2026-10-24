@@ -306,6 +306,13 @@ impl TestWindow {
 }
 
 impl PlatformWindow for TestWindow {
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> anyhow::Result<Arc<dyn crate::GpuService>> {
+        let platform = self.0.lock().platform.upgrade();
+        let platform = platform.ok_or_else(|| anyhow::anyhow!("test platform was dropped"))?;
+        crate::Platform::gpu_service(platform.as_ref())
+    }
+
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         let state = self.0.lock();
         state

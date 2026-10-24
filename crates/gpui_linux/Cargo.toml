@@ -13,6 +13,7 @@ path = "src/gpui_linux.rs"
 doctest = false
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions", "gpui_wgpu?/gpu-extensions"]
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
 wayland = [

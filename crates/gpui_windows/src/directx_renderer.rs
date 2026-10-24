@@ -5,6 +5,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
+#[cfg(feature = "gpu-extensions")]
+use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -54,6 +56,10 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    #[cfg(feature = "gpu-extensions")]
+    extensions: crate::gpu_compositor::ExtensionRenderer,
+    #[cfg(feature = "gpu-extensions")]
+    extension_clip: Option<windows::Win32::Foundation::RECT>,
 }
 
 /// Direct3D objects
@@ -63,6 +69,8 @@ pub(crate) struct DirectXRendererDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) gpu_service: Arc<crate::gpu_extensions::DirectXGpuService>,
     dxgi_device: Option<IDXGIDevice>,
     annotation: Option<ID3DUserDefinedAnnotation>,
 }
@@ -131,6 +139,7 @@ impl DirectXRendererDevices {
             dxgi_factory,
             device,
             device_context,
+            ..
         } = directx_devices;
         let dxgi_device = if disable_direct_composition {
             None
@@ -144,6 +153,8 @@ impl DirectXRendererDevices {
             dxgi_factory: dxgi_factory.clone(),
             device: device.clone(),
             device_context: device_context.clone(),
+            #[cfg(feature = "gpu-extensions")]
+            gpu_service: directx_devices.gpu_service.clone(),
             dxgi_device,
             annotation,
         })
@@ -182,7 +193,13 @@ impl DirectXRenderer {
             Some(composition)
         };
 
+        #[cfg(feature = "gpu-extensions")]
+        let extensions = crate::gpu_compositor::ExtensionRenderer::new(&devices.device)?;
         Ok(DirectXRenderer {
+            #[cfg(feature = "gpu-extensions")]
+            extensions,
+            #[cfg(feature = "gpu-extensions")]
+            extension_clip: None,
             hwnd,
             atlas,
             devices: Some(devices),
@@ -195,6 +212,16 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
         })
+    }
+
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) fn gpu_service(&self) -> Result<Arc<dyn GpuService>> {
+        Ok(self
+            .devices
+            .as_ref()
+            .context("GPU device is unavailable")?
+            .gpu_service
+            .clone())
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -221,6 +248,7 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
+            #[cfg(not(feature = "gpu-extensions"))]
             device_context.ClearRenderTargetView(
                 resources
                     .render_target_view
@@ -228,6 +256,30 @@ impl DirectXRenderer {
                     .context("missing render target view")?,
                 clear_color,
             );
+            #[cfg(feature = "gpu-extensions")]
+            {
+                let target = resources
+                    .render_target_view
+                    .as_ref()
+                    .context("missing render target view")?;
+                if let Some(rectangle) = self.extension_clip {
+                    let context: ID3D11DeviceContext1 = device_context
+                        .cast()
+                        .context("GPU extensions require D3D11.1 context support")?;
+                    context.ClearView(target, clear_color, Some(&[rectangle]));
+                } else {
+                    device_context.ClearRenderTargetView(target, clear_color);
+                }
+                device_context.RSSetState(&self.extensions.rasterizer);
+                device_context.RSSetScissorRects(Some(&[self.extension_clip.unwrap_or(
+                    windows::Win32::Foundation::RECT {
+                        left: 0,
+                        top: 0,
+                        right: self.width as i32,
+                        bottom: self.height as i32,
+                    },
+                )]));
+            }
             device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
@@ -242,6 +294,7 @@ impl DirectXRenderer {
     }
 
     #[inline]
+    #[cfg(not(feature = "gpu-extensions"))]
     fn present(&mut self) -> Result<()> {
         let result = unsafe {
             self.resources
@@ -318,6 +371,11 @@ impl DirectXRenderer {
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
+        #[cfg(feature = "gpu-extensions")]
+        {
+            self.extensions = crate::gpu_compositor::ExtensionRenderer::new(&devices.device)?;
+            self.extension_clip = None;
+        }
         self.devices = Some(devices);
         self.resources = Some(resources);
         self.globals = globals;
@@ -337,8 +395,15 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        #[cfg(feature = "gpu-extensions")]
+        {
+            return self.draw_retained(scene, background_appearance);
+        }
+        #[cfg(not(feature = "gpu-extensions"))]
+        {
+            self.render(scene, background_appearance)?;
+            self.present()
+        }
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -385,6 +450,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                #[cfg(feature = "gpu-extensions")]
+                PrimitiveBatch::GpuTextures(range) => self.draw_gpu_textures(&scene.gpu_textures[range]),
             }
             .with_context(|| {
                 format!(
@@ -422,16 +489,43 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
+        #[cfg(not(feature = "gpu-extensions"))]
         self.render(scene, background_appearance)?;
+        #[cfg(feature = "gpu-extensions")]
+        let capture_target = {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let target = crate::gpu_compositor::RetainedTarget::new(
+                &devices.device,
+                [self.width, self.height],
+            )?;
+            let saved_view = self
+                .resources
+                .as_mut()
+                .context("resources missing")?
+                .render_target_view
+                .replace(target.view.clone());
+            let result = self.render(scene, background_appearance);
+            self.resources
+                .as_mut()
+                .context("resources missing")?
+                .render_target_view = saved_view;
+            result?;
+            target.texture
+        };
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let device = &devices.device;
         let context = &devices.device_context;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        let render_target = resources
+        #[cfg(not(feature = "gpu-extensions"))]
+        let render_target = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
             .render_target
             .as_ref()
             .context("render target missing")?;
+        #[cfg(feature = "gpu-extensions")]
+        let render_target = &capture_target;
 
         // A CPU-readable copy of the render target.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -490,6 +584,8 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        #[cfg(feature = "gpu-extensions")]
+        self.extensions.invalidate();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -813,6 +909,186 @@ impl DirectXRenderer {
         )
     }
 
+    #[cfg(feature = "gpu-extensions")]
+    fn draw_gpu_textures(&mut self, textures: &[PaintGpuTexture]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        for texture in textures {
+            if let Some(clip) = self.extension_clip {
+                let bounds = texture.bounds.intersect(&texture.content_mask.bounds);
+                if bounds.origin.x.0 >= clip.right as f32
+                    || bounds.origin.y.0 >= clip.bottom as f32
+                    || bounds.origin.x.0 + bounds.size.width.0 <= clip.left as f32
+                    || bounds.origin.y.0 + bounds.size.height.0 <= clip.top as f32
+                {
+                    continue;
+                }
+            }
+            self.extensions.pipeline.draw(
+                &devices.device_context,
+                &devices.gpu_service,
+                texture,
+                [self.width, self.height],
+            )?;
+        }
+        unsafe {
+            devices
+                .device_context
+                .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
+            devices
+                .device_context
+                .VSSetConstantBuffers(1, Some(slice::from_ref(&self.globals.batch_params_buffer)));
+            devices
+                .device_context
+                .PSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu-extensions")]
+    fn draw_retained(
+        &mut self,
+        scene: &Scene,
+        appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        use crate::gpu_compositor::copy_rectangle;
+        let composition_started = std::time::Instant::now();
+        let appearance_key = match appearance {
+            WindowBackgroundAppearance::Opaque => 0,
+            WindowBackgroundAppearance::Transparent => 1,
+            WindowBackgroundAppearance::Blurred => 2,
+            WindowBackgroundAppearance::MicaBackdrop => 3,
+            WindowBackgroundAppearance::MicaAltBackdrop => 4,
+        };
+        let devices = self.devices.as_ref().context("devices missing")?.clone();
+        if self.extensions.occluded {
+            let status = unsafe {
+                self.resources
+                    .as_ref()
+                    .context("resources missing")?
+                    .swap_chain
+                    .Present(0, DXGI_PRESENT_TEST)
+            };
+            status.ok().context("Testing swapchain visibility")?;
+            if status == DXGI_STATUS_OCCLUDED {
+                devices.gpu_service.record_unchanged_frame();
+                return Ok(());
+            }
+            self.extensions.occluded = false;
+            self.extensions.damage.invalidate();
+        }
+        for texture in &scene.gpu_textures {
+            texture
+                .texture
+                .as_any()
+                .downcast_ref::<crate::gpu_extensions::DirectXGpuTexture>()
+                .context("Unsupported GPU texture backend")?
+                .validate(&devices.gpu_service)?;
+        }
+        let atlas_revision = self.atlas.content_revision();
+        if atlas_revision != self.extensions.atlas_revision {
+            self.extensions.damage.invalidate_atlas();
+        }
+        let rectangles =
+            self.extensions
+                .damage
+                .damage(scene, [self.width, self.height], appearance_key)?;
+        let Some(rectangle) = rectangles.first().copied() else {
+            devices.gpu_service.record_unchanged_frame();
+            self.extensions.damage.commit(scene, appearance_key)?;
+            self.extensions.atlas_revision = atlas_revision;
+            return Ok(());
+        };
+        self.extensions
+            .ensure_targets(&devices.device, [self.width, self.height])?;
+        let front = self
+            .extensions
+            .front
+            .take()
+            .context("retained target missing")?;
+        let candidate = self
+            .extensions
+            .candidate
+            .take()
+            .context("candidate target missing")?;
+        if let Some(repair) = self.extensions.repair.take() {
+            copy_rectangle(
+                &devices.device_context,
+                &front.texture,
+                &candidate.texture,
+                repair,
+            );
+        }
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let swap_view = resources.render_target_view.replace(candidate.view.clone());
+        self.extension_clip = Some(rectangle);
+        let result = self.render(scene, appearance);
+        self.extension_clip = None;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        resources.render_target_view = swap_view;
+        unsafe {
+            devices.device_context.OMSetRenderTargets(None, None);
+        }
+        let mut occluded = false;
+        let mut compositor_cpu_ns = 0;
+        let mut present_cpu_ns = 0;
+        let mut presentation_end = composition_started;
+        let result = result.and_then(|()| {
+            copy_rectangle(
+                &devices.device_context,
+                &candidate.texture,
+                resources
+                    .render_target
+                    .as_ref()
+                    .context("swapchain target missing")?,
+                rectangle,
+            );
+            let parameters = DXGI_PRESENT_PARAMETERS {
+                DirtyRectsCount: 1,
+                pDirtyRects: &rectangle as *const _ as *mut _,
+                ..Default::default()
+            };
+            compositor_cpu_ns = composition_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            let present_started = std::time::Instant::now();
+            let status = unsafe {
+                resources
+                    .swap_chain
+                    .Present1(0, DXGI_PRESENT(0), &parameters)
+            };
+            presentation_end = std::time::Instant::now();
+            present_cpu_ns = presentation_end
+                .duration_since(present_started)
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            occluded = status == DXGI_STATUS_OCCLUDED;
+            status.ok().context("Presenting retained GPU frame")
+        });
+        if result.is_ok() {
+            let pixels = (rectangle.right - rectangle.left) as u64
+                * (rectangle.bottom - rectangle.top) as u64;
+            devices.gpu_service.record_presentation(
+                pixels,
+                pixels == u64::from(self.width) * u64::from(self.height),
+                compositor_cpu_ns,
+                present_cpu_ns,
+                presentation_end,
+            );
+            self.extensions.front = Some(candidate);
+            self.extensions.candidate = Some(front);
+            self.extensions.repair = Some(rectangle);
+            self.extensions.damage.commit(scene, appearance_key)?;
+            self.extensions.atlas_revision = atlas_revision;
+            self.extensions.occluded = occluded;
+        } else {
+            self.extensions.front = Some(front);
+            self.extensions.candidate = Some(candidate);
+            self.extensions.repair = Some(rectangle);
+        }
+        result
+    }
+
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
@@ -867,6 +1143,14 @@ impl DirectXRenderer {
 
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
+        #[cfg(feature = "gpu-extensions")]
+        self.invalidate_presentation();
+    }
+
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) fn invalidate_presentation(&mut self) {
+        self.extensions.damage.invalidate();
+        self.extensions.occluded = false;
     }
 }
 
@@ -2066,5 +2350,442 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(all(test, feature = "gpu-extensions"))]
+mod gpu_retained_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use windows::{Win32::UI::WindowsAndMessaging::*, core::w};
+
+    struct HiddenWindow(HWND);
+    impl Drop for HiddenWindow {
+        fn drop(&mut self) {
+            unsafe { DestroyWindow(self.0) }.log_err();
+        }
+    }
+
+    fn scene(overlay_x: f32, show_overlay: bool) -> Scene {
+        let mut scene = Scene::default();
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(96.0), ScaledPixels(64.0)),
+        );
+        let content_mask = ContentMask { bounds };
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask,
+            background: gpui::rgba(0x224466ff).into(),
+            ..Default::default()
+        });
+        if show_overlay {
+            let shadow_bounds = Bounds::new(
+                point(ScaledPixels(overlay_x + 2.0), ScaledPixels(18.0)),
+                size(ScaledPixels(13.0), ScaledPixels(19.0)),
+            );
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(2.0),
+                bounds: shadow_bounds,
+                content_mask,
+                color: gpui::rgba(0x00000080).into(),
+                corner_radii: Default::default(),
+                element_bounds: shadow_bounds,
+                element_corner_radii: Default::default(),
+                inset: 0,
+                pad: 0,
+            });
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(overlay_x), ScaledPixels(17.0)),
+                    size(ScaledPixels(13.0), ScaledPixels(19.0)),
+                ),
+                content_mask,
+                background: gpui::rgba(0xff000080).into(),
+                ..Default::default()
+            });
+            let mut builder = gpui::PathBuilder::stroke(gpui::px(1.5));
+            builder.move_to(point(gpui::px(overlay_x), gpui::px(15.5)));
+            builder.line_to(point(gpui::px(overlay_x + 18.0), gpui::px(22.0)));
+            builder.line_to(point(gpui::px(overlay_x + 5.0), gpui::px(37.0)));
+            let mut path = builder.build().expect("overlay path").scale(1.0);
+            path.content_mask = content_mask;
+            path.color = gpui::rgba(0x00ff00a0).into();
+            scene.insert_primitive(path);
+        }
+        scene.finish();
+        scene
+    }
+
+    fn retained_pixels(renderer: &DirectXRenderer) -> Result<Vec<u8>> {
+        let devices = renderer.devices.as_ref().context("device")?;
+        let target = renderer
+            .extensions
+            .front
+            .as_ref()
+            .context("retained target")?;
+        let texture = devices.gpu_service.wrap_texture(target.texture.clone())?;
+        let mut readback = devices.gpu_service.readback(
+            &texture,
+            GpuRect {
+                x: 0,
+                y: 0,
+                width: renderer.width,
+                height: renderer.height,
+            },
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(image) = readback.poll()? {
+                return Ok(image.pixels);
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "retained-frame readback timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn gpu_retained_updates_match_full_frames_through_swapchain_rotations() -> Result<()> {
+        let window = HiddenWindow(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("GPUI offscreen compositor validation"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                96,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(size(DevicePixels(96), DevicePixels(64)))?;
+        for (x, visible) in [
+            (11.0, true),
+            (16.0, true),
+            (51.0, true),
+            (23.0, true),
+            (23.0, false),
+            (12.0, true),
+        ] {
+            let scene = scene(x, visible);
+            renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
+            let retained = retained_pixels(&renderer)?;
+            let reference = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+            assert_eq!(
+                retained,
+                reference.into_raw(),
+                "overlay {x}, visible {visible}"
+            );
+            assert!(
+                renderer
+                    .extensions
+                    .damage
+                    .damage(&scene, [96, 64], 0)?
+                    .is_empty()
+            );
+            renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
+        }
+        let diagnostics = devices.gpu_service.diagnostics();
+        assert_eq!(diagnostics.presentations, 6);
+        assert_eq!(diagnostics.full_presentations, 1);
+        assert_eq!(diagnostics.skipped_presentations, 6);
+        assert!(diagnostics.presented_pixels < 96 * 64 * 6);
+        drop(renderer);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_windows_share_device_resize_and_reject_incomplete_candidates() -> Result<()> {
+        let create_window = || -> Result<HiddenWindow> {
+            Ok(HiddenWindow(unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("GPUI lifecycle validation"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    96,
+                    64,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }?))
+        };
+        let first_window = create_window()?;
+        let second_window = create_window()?;
+        let devices = DirectXDevices::new()?;
+        let mut first = DirectXRenderer::new(first_window.0, &devices, true)?;
+        let mut second = DirectXRenderer::new(second_window.0, &devices, true)?;
+        first.resize(size(DevicePixels(96), DevicePixels(64)))?;
+        second.resize(size(DevicePixels(96), DevicePixels(64)))?;
+        assert_eq!(
+            first.gpu_service()?.service_id(),
+            second.gpu_service()?.service_id()
+        );
+        let complete = scene(20.0, true);
+        first.draw(&complete, WindowBackgroundAppearance::Opaque)?;
+        second.draw(&complete, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(retained_pixels(&first)?, retained_pixels(&second)?);
+
+        let previous = retained_pixels(&first)?;
+        let foreign = crate::gpu_extensions::DirectXGpuService::new(
+            devices.device.clone(),
+            devices.device_context.clone(),
+        );
+        let texture = foreign.wrap_texture(
+            first
+                .extensions
+                .front
+                .as_ref()
+                .context("front target")?
+                .texture
+                .clone(),
+        )?;
+        let mut invalid = scene(42.0, true);
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(96.0), ScaledPixels(64.0)),
+        );
+        invalid.insert_primitive(PaintGpuTexture {
+            order: 0,
+            bounds,
+            destination: bounds,
+            content_mask: ContentMask { bounds },
+            texture,
+            options: Default::default(),
+        });
+        invalid.finish();
+        assert!(
+            first
+                .draw(&invalid, WindowBackgroundAppearance::Opaque)
+                .is_err()
+        );
+        assert_eq!(
+            retained_pixels(&first)?,
+            previous,
+            "failed candidate changed the complete window image"
+        );
+        assert_eq!(devices.gpu_service.diagnostics().presentations, 2);
+
+        first.resize(size(DevicePixels(128), DevicePixels(80)))?;
+        first.draw(&complete, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(
+            retained_pixels(&first)?,
+            first
+                .render_to_image(&complete, WindowBackgroundAppearance::Opaque)?
+                .into_raw()
+        );
+        assert_eq!(devices.gpu_service.diagnostics().full_presentations, 3);
+        assert_eq!(
+            retained_pixels(&second)?,
+            previous,
+            "resizing one window altered the other"
+        );
+        first.invalidate_presentation();
+        first.draw(&complete, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(devices.gpu_service.diagnostics().full_presentations, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_atlas_reuse_redraws_identical_sprite_metadata() -> Result<()> {
+        let window = HiddenWindow(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("GPUI atlas validation"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                96,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(size(DevicePixels(96), DevicePixels(64)))?;
+        let first_key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let tile = renderer
+            .atlas
+            .get_or_insert_with(first_key.clone(), &mut || {
+                Ok(Some((
+                    size(DevicePixels(1), DevicePixels(1)),
+                    std::borrow::Cow::Borrowed(&[0, 0, 255, 255]),
+                )))
+            })?
+            .context("initial atlas tile")?;
+        let mut scene = scene(0.0, false);
+        let bounds = Bounds::new(
+            point(ScaledPixels(20.0), ScaledPixels(10.0)),
+            size(ScaledPixels(12.0), ScaledPixels(12.0)),
+        );
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            tile,
+            grayscale: false.into(),
+            opacity: 1.0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Default::default(),
+        });
+        scene.finish();
+        renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
+        let before = retained_pixels(&renderer)?;
+        renderer.atlas.remove(&first_key);
+        let second_key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(2),
+            frame_index: 0,
+        });
+        let replacement = renderer
+            .atlas
+            .get_or_insert_with(second_key, &mut || {
+                Ok(Some((
+                    size(DevicePixels(1), DevicePixels(1)),
+                    std::borrow::Cow::Borrowed(&[255, 0, 0, 255]),
+                )))
+            })?
+            .context("replacement atlas tile")?;
+        assert_eq!(
+            tile, replacement,
+            "exercise recycled atlas allocation identity"
+        );
+        renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
+        let after = retained_pixels(&renderer)?;
+        assert_ne!(before, after);
+        assert_eq!(
+            after,
+            renderer
+                .render_to_image(&scene, WindowBackgroundAppearance::Opaque)?
+                .into_raw()
+        );
+        assert_eq!(devices.gpu_service.diagnostics().presentations, 2);
+        assert_eq!(devices.gpu_service.diagnostics().full_presentations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_texture_scene_order_and_replay_interleave_with_native_quads() -> Result<()> {
+        let window = HiddenWindow(unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("GPUI texture order validation"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                96,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }?);
+        let devices = DirectXDevices::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(size(DevicePixels(96), DevicePixels(64)))?;
+        let source = devices.gpu_service.with_context(|context| {
+            let pixels = [0u8, 255, 0, 255];
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixels.as_ptr().cast(),
+                SysMemPitch: 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut texture = None;
+            unsafe {
+                context.device.CreateTexture2D(
+                    &D3D11_TEXTURE2D_DESC {
+                        Width: 1,
+                        Height: 1,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                        ..Default::default()
+                    },
+                    Some(&data),
+                    Some(&mut texture),
+                )
+            }?;
+            texture.context("ordered test texture")
+        })?;
+        let texture = devices.gpu_service.wrap_texture(source)?;
+        let mut frame = scene(0.0, false);
+        let bounds = Bounds::new(
+            point(ScaledPixels(20.0), ScaledPixels(20.0)),
+            size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        );
+        let content_mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(96.0), ScaledPixels(64.0)),
+            ),
+        };
+        frame.insert_primitive(PaintGpuTexture {
+            order: 0,
+            bounds,
+            destination: bounds,
+            content_mask,
+            texture,
+            options: GpuTextureOptions::default(),
+        });
+        frame.insert_primitive(Quad {
+            bounds: Bounds::new(
+                point(ScaledPixels(24.0), ScaledPixels(20.0)),
+                size(ScaledPixels(16.0), ScaledPixels(16.0)),
+            ),
+            content_mask,
+            background: gpui::rgba(0xff000080).into(),
+            ..Default::default()
+        });
+        frame.finish();
+        renderer.draw(&frame, WindowBackgroundAppearance::Opaque)?;
+        let pixels = retained_pixels(&renderer)?;
+        assert_eq!(
+            &pixels[(22 * 96 + 22) * 4..(22 * 96 + 22) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+        let mixed = &pixels[(22 * 96 + 26) * 4..(22 * 96 + 26) * 4 + 4];
+        assert!(
+            (127..=128).contains(&mixed[0])
+                && (127..=128).contains(&mixed[1])
+                && mixed[2] == 0
+                && mixed[3] == 255,
+            "{mixed:?}"
+        );
+        let mut replay = Scene::default();
+        replay.replay(0..frame.len(), &frame);
+        replay.finish();
+        renderer.draw(&replay, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(devices.gpu_service.diagnostics().skipped_presentations, 1);
+        assert_eq!(retained_pixels(&renderer)?, pixels);
+        drop(renderer);
+        Ok(())
     }
 }

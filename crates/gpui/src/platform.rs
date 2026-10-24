@@ -364,6 +364,12 @@ pub use platform_info::{OperatingSystem, PlatformInfo, PlatformTarget};
 
 #[expect(missing_docs)]
 pub trait Platform: 'static {
+    /// Obtain this platform's GPU service, including in offscreen mode.
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> Result<Arc<dyn crate::GpuService>> {
+        anyhow::bail!("GPU extensions are not supported by this platform")
+    }
+
     /// Returns the host OS and application target reported by this backend.
     fn platform_info(&self) -> PlatformInfo;
 
@@ -1222,6 +1228,12 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Obtain the GPU service backing this window.
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> Result<Arc<dyn crate::GpuService>> {
+        anyhow::bail!("GPU extensions are not supported by this window")
+    }
+
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;

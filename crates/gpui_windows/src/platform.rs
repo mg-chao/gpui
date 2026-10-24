@@ -380,7 +380,31 @@ impl WindowsPlatform {
     }
 
     fn is_windowed(&self) -> bool {
-        self.inner.state.directx_devices.borrow().is_some()
+        #[cfg(feature = "gpu-extensions")]
+        {
+            self.vsync_stop.borrow().is_some()
+        }
+        #[cfg(not(feature = "gpu-extensions"))]
+        {
+            self.inner.state.directx_devices.borrow().is_some()
+        }
+    }
+
+    #[cfg(feature = "gpu-extensions")]
+    fn ensure_gpu_service(&self) -> Result<()> {
+        if self.inner.state.directx_devices.borrow().is_none() {
+            let devices = DirectXDevices::new().context("Creating offscreen GPUI devices")?;
+            if let Some(text_system) = &self.direct_write_text_system {
+                text_system.handle_gpu_lost(&devices)?;
+            }
+            *self.inner.state.directx_devices.borrow_mut() = Some(devices);
+        }
+        if let Some(devices) = self.inner.state.directx_devices.borrow().as_ref() {
+            devices
+                .gpu_service
+                .attach_retirement_polling(&self.foreground_executor, &self.background_executor);
+        }
+        Ok(())
     }
 
     /// Connects in the initial windowing mode, before the app finishes launching.
@@ -408,13 +432,22 @@ impl WindowsPlatform {
 
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
-        let devices = DirectXDevices::new().context("Creating DirectX devices")?;
-        if let Some(text_system) = &self.direct_write_text_system {
-            text_system.handle_gpu_lost(&devices)?;
+        #[cfg(feature = "gpu-extensions")]
+        {
+            self.ensure_gpu_service()?;
+            self.begin_vsync_thread();
+            return Ok(());
         }
-        *self.inner.state.directx_devices.borrow_mut() = Some(devices);
-        self.begin_vsync_thread();
-        Ok(())
+        #[cfg(not(feature = "gpu-extensions"))]
+        {
+            let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+            if let Some(text_system) = &self.direct_write_text_system {
+                text_system.handle_gpu_lost(&devices)?;
+            }
+            *self.inner.state.directx_devices.borrow_mut() = Some(devices);
+            self.begin_vsync_thread();
+            Ok(())
+        }
     }
 
     /// Stops vsync and releases the DirectX devices. No window may be open.
@@ -427,7 +460,11 @@ impl WindowsPlatform {
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.release_gpu();
         }
-        self.inner.state.directx_devices.borrow_mut().take();
+        if let Some(devices) = self.inner.state.directx_devices.borrow_mut().take() {
+            #[cfg(feature = "gpu-extensions")]
+            devices.gpu_service.invalidate();
+            drop(devices);
+        }
     }
 
     fn begin_vsync_thread(&self) {
@@ -529,6 +566,20 @@ fn encode_restart_arguments(arguments: &[OsString]) -> OsString {
 }
 
 impl Platform for WindowsPlatform {
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> Result<Arc<dyn GpuService>> {
+        self.ensure_gpu_service()?;
+        Ok(self
+            .inner
+            .state
+            .directx_devices
+            .borrow()
+            .as_ref()
+            .context("GPU device is unavailable")?
+            .gpu_service
+            .clone())
+    }
+
     fn platform_info(&self) -> gpui::PlatformInfo {
         gpui::PlatformInfo {
             os: gpui::OperatingSystem::Windows,
@@ -1399,6 +1450,11 @@ impl WindowsPlatformInner {
         let mut current = self.state.directx_devices.borrow_mut();
         // The platform may have switched to headless while the device was being recovered.
         if current.is_some() {
+            #[cfg(feature = "gpu-extensions")]
+            directx_devices.gpu_service.attach_retirement_polling(
+                &ForegroundExecutor::new(self.dispatcher.clone()),
+                &BackgroundExecutor::new(self.dispatcher.clone()),
+            );
             *current = Some(directx_devices.clone());
         }
 
@@ -1408,6 +1464,10 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
+        #[cfg(feature = "gpu-extensions")]
+        if let Some(devices) = self.inner.state.directx_devices.borrow().as_ref() {
+            devices.gpu_service.invalidate();
+        }
         if let Some(stop) = self.vsync_stop.borrow_mut().take() {
             stop.store(true, Ordering::Release);
         }
@@ -1722,9 +1782,21 @@ fn handle_gpu_device_lost(
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
 
-    *directx_devices = try_to_recover_from_device_lost(|| {
+    let replacement = try_to_recover_from_device_lost(|| {
         DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
     })?;
+    #[cfg(feature = "gpu-extensions")]
+    let replacement = {
+        let mut replacement = replacement;
+        replacement.gpu_service = crate::gpu_extensions::DirectXGpuService::new_for_owner(
+            replacement.device.clone(),
+            replacement.device_context.clone(),
+            directx_devices.gpu_service.owner_thread(),
+        );
+        directx_devices.gpu_service.invalidate();
+        replacement
+    };
+    *directx_devices = replacement;
     log::info!("DirectX devices successfully recreated.");
 
     let lparam = LPARAM(directx_devices as *const _ as _);

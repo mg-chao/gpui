@@ -1606,6 +1606,10 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    #[cfg(feature = "gpu-extensions")]
+                    PrimitiveBatch::GpuTextures(_) => anyhow::bail!(
+                        "GPU texture extensions are not implemented by the WGPU backend"
+                    ),
                 }
             }
         }

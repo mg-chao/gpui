@@ -123,6 +123,15 @@ impl AppContext for TestAppContext {
 }
 
 impl TestAppContext {
+    /// Installs a GPU service shared by this test app and all of its windows.
+    ///
+    /// The caller retains the native service owner for the duration of the test.
+    /// This does not replace a test window's headless renderer.
+    #[cfg(feature = "gpu-extensions")]
+    pub fn set_gpu_service(&mut self, service: Arc<dyn crate::GpuService>) {
+        self.test_platform.gpu_service.replace(Some(service));
+    }
+
     /// Sets the runtime identity used by this test's application.
     pub fn set_platform_info(&mut self, platform_info: crate::PlatformInfo) {
         self.test_platform.platform_info.set(platform_info);

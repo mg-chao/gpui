@@ -10,6 +10,7 @@ autoexamples = false
 workspace = true
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions", "gpui_wgpu/gpu-extensions"]
 default = ["multithreaded"]
 multithreaded = ["dep:wasm_thread", "scheduler/wasm-threads"]
 

@@ -25,6 +25,7 @@ path = "tests/text_input.rs"
 harness = false
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions", "gpui_apple/gpu-extensions"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 
 [dependencies]

@@ -30,6 +30,8 @@ use std::{
 /// TestPlatform implements the Platform trait for use in tests.
 pub(crate) struct TestPlatform {
     pub(crate) platform_info: Cell<crate::PlatformInfo>,
+    #[cfg(feature = "gpu-extensions")]
+    pub(crate) gpu_service: RefCell<Option<Arc<dyn crate::GpuService>>>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
 
@@ -233,6 +235,8 @@ impl TestPlatform {
                 },
             }),
             background_executor: executor,
+            #[cfg(feature = "gpu-extensions")]
+            gpu_service: Default::default(),
             foreground_executor,
             #[cfg(any(test, feature = "test-support"))]
             prompts: Default::default(),
@@ -461,6 +465,14 @@ impl TestPlatform {
 }
 
 impl Platform for TestPlatform {
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> Result<Arc<dyn crate::GpuService>> {
+        self.gpu_service
+            .borrow()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no GPU service installed on the test platform"))
+    }
+
     fn platform_info(&self) -> crate::PlatformInfo {
         self.platform_info.get()
     }

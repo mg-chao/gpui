@@ -239,6 +239,8 @@ impl WindowsWindowInner {
         let scale_factor = self.state.scale_factor.get();
         let mut should_resize_renderer = false;
         if let Some(restore_from_minimized) = self.state.restore_from_minimized.take() {
+            #[cfg(feature = "gpu-extensions")]
+            self.state.renderer.borrow_mut().invalidate_presentation();
             self.state
                 .callbacks
                 .request_frame
@@ -1264,6 +1266,8 @@ impl WindowsWindowInner {
     ) -> Option<isize> {
         self.report_visibility();
         if wparam.0 == 1 {
+            #[cfg(feature = "gpu-extensions")]
+            self.state.renderer.borrow_mut().invalidate_presentation();
             self.draw_window(handle, false);
         }
         None

@@ -2002,6 +2002,12 @@ impl App {
         self.platform.platform_info()
     }
 
+    /// Obtain GPUI's device service without requiring a window or swapchain.
+    #[cfg(feature = "gpu-extensions")]
+    pub fn gpu_service(&self) -> Result<Arc<dyn crate::GpuService>> {
+        self.platform.gpu_service()
+    }
+
     /// Returns the file URL of the executable with the specified name in the application bundle
     pub fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         self.platform.path_for_auxiliary_executable(name)

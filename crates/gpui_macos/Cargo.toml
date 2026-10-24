@@ -13,6 +13,7 @@ path = "src/gpui_macos.rs"
 doctest = false
 
 [features]
+gpu-extensions = ["gpui/gpu-extensions", "gpui_apple/gpu-extensions"]
 default = ["gpui/default"]
 bench-support = ["gpui/bench-support", "gpui_apple/bench-support"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]

@@ -26,6 +26,10 @@ pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod gestures;
 mod global;
+#[cfg(feature = "gpu-extensions")]
+mod gpu_extensions;
+#[cfg(feature = "gpu-extensions")]
+pub use gpu_extensions::*;
 #[cfg(gpui_hot_reload)]
 mod hot_reload;
 mod input;

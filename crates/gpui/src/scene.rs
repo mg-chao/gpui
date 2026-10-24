@@ -50,6 +50,8 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(feature = "gpu-extensions")]
+    pub gpu_textures: Vec<PaintGpuTexture>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +68,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(feature = "gpu-extensions")]
+        self.gpu_textures.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -129,6 +133,11 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
+            #[cfg(feature = "gpu-extensions")]
+            Primitive::GpuTexture(texture) => {
+                texture.order = order;
+                self.gpu_textures.push(texture.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -160,6 +169,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        #[cfg(feature = "gpu-extensions")]
+        self.gpu_textures.sort_by_key(|texture| texture.order);
     }
 
     #[cfg_attr(
@@ -185,6 +196,10 @@ impl Scene {
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            #[cfg(feature = "gpu-extensions")]
+            gpu_textures_start: 0,
+            #[cfg(feature = "gpu-extensions")]
+            gpu_textures_iter: self.gpu_textures.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -209,6 +224,8 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    #[cfg(feature = "gpu-extensions")]
+    GpuTexture,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +245,8 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    #[cfg(feature = "gpu-extensions")]
+    GpuTexture(PaintGpuTexture),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +261,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            #[cfg(feature = "gpu-extensions")]
+            Primitive::GpuTexture(texture) => &texture.bounds,
         }
     }
 
@@ -255,6 +276,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            #[cfg(feature = "gpu-extensions")]
+            Primitive::GpuTexture(texture) => &texture.content_mask,
         }
     }
 }
@@ -281,6 +304,10 @@ struct BatchIterator<'a> {
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    #[cfg(feature = "gpu-extensions")]
+    gpu_textures_start: usize,
+    #[cfg(feature = "gpu-extensions")]
+    gpu_textures_iter: Peekable<slice::Iter<'a, PaintGpuTexture>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -290,6 +317,11 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            #[cfg(feature = "gpu-extensions")]
+            (
+                self.gpu_textures_iter.peek().map(|texture| texture.order),
+                PrimitiveKind::GpuTexture,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -447,6 +479,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            #[cfg(feature = "gpu-extensions")]
+            PrimitiveKind::GpuTexture => {
+                let start = self.gpu_textures_start;
+                self.gpu_textures_iter.next();
+                self.gpu_textures_start += 1;
+                while self
+                    .gpu_textures_iter
+                    .next_if(|texture| (texture.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    self.gpu_textures_start += 1;
+                }
+                Some(PrimitiveBatch::GpuTextures(start..self.gpu_textures_start))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -493,6 +539,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    #[cfg(feature = "gpu-extensions")]
+    GpuTextures(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,10 +573,13 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            #[cfg(feature = "gpu-extensions")]
+            Self::GpuTextures(range) => format!("GPU textures ({})", range.len()),
         }
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -549,6 +600,7 @@ impl From<Quad> for Primitive {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -568,6 +620,7 @@ impl From<Underline> for Primitive {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -705,6 +758,7 @@ impl Default for TransformationMatrix {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -724,6 +778,7 @@ impl From<MonochromeSprite> for Primitive {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -743,6 +798,7 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -784,6 +840,7 @@ impl From<PaintSurface> for Primitive {
 pub struct PathId(pub usize);
 
 /// A line made up of a series of vertices and control points.
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Clone, Debug)]
 #[expect(missing_docs)]
 pub struct Path<P: Clone + Debug + Default + PartialEq> {
@@ -928,6 +985,7 @@ impl From<Path<ScaledPixels>> for Primitive {
     }
 }
 
+#[cfg_attr(feature = "gpu-extensions", derive(PartialEq))]
 #[derive(Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -945,5 +1003,30 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+/// A retained, GPU-resident image ordered alongside GPUI's ordinary primitives.
+#[cfg(feature = "gpu-extensions")]
+#[derive(Clone, Debug)]
+pub struct PaintGpuTexture {
+    /// Scene draw order, assigned by insertion.
+    pub order: DrawOrder,
+    /// Axis-aligned transformed bounds in physical pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Original destination before the affine transform.
+    pub destination: Bounds<ScaledPixels>,
+    /// Inherited GPUI content clip.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Immutable published image resource.
+    pub texture: std::sync::Arc<dyn crate::GpuTexture>,
+    /// Compositing and revision parameters; transform translation is in physical pixels.
+    pub options: crate::GpuTextureOptions,
+}
+
+#[cfg(feature = "gpu-extensions")]
+impl From<PaintGpuTexture> for Primitive {
+    fn from(texture: PaintGpuTexture) -> Self {
+        Self::GpuTexture(texture)
     }
 }

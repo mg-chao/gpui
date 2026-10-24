@@ -632,6 +632,11 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    #[cfg(feature = "gpu-extensions")]
+    fn gpu_service(&self) -> Result<Arc<dyn GpuService>> {
+        self.state.renderer.borrow().gpu_service()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }

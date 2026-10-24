@@ -11,6 +11,11 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+#[cfg(feature = "gpu-extensions")]
+mod gpu_compositor;
+/// Scoped access to GPUI's existing D3D11 device and retained image resources.
+#[cfg(feature = "gpu-extensions")]
+pub mod gpu_extensions;
 mod keyboard;
 mod platform;
 mod system_notifications;
